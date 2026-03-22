@@ -1,0 +1,200 @@
+# AI News Digest Workflow
+#
+# A complete example demonstrating multi-agent orchestration:
+# - News fetching with web tools
+# - Content writing with Alex (writer agent)
+# - Editorial review with Bob (editor agent)
+# - Translation with Alice (translator agent)
+# - Quality assurance with Colly (QA agent)
+# - Git publishing
+#
+# This workflow inspired the OpenClaw workflow engine RFC.
+
+name: ai-news-digest
+version: "1.0"
+description: |
+  Daily AI news digest with multi-agent editorial workflow.
+  Fetches news from official sources, writes analysis, translates
+  to Chinese, and publishes to GitHub.
+
+triggers:
+  - cron: "0 8 * * *"           # Daily at 8:00 AM
+  - command: "/news-digest"     # Manual trigger via chat
+
+agents:
+  alex: ./subagents/alex-chen.md      # Tech news writer
+  bob: ./subagents/bob-dillen.md      # Editorial director
+  alice: ./subagents/alice-larry.md   # EN→ZH translator
+  colly: ./subagents/colly-markus.md  # Translation QA
+
+inputs:
+  date: ${{ env.DATE || today() }}
+  output_dir: /tmp/tech-news/ai-news
+
+pipeline:
+  # ──────────────────────────────────────────────────────────────
+  # Step 1: Fetch news from official sources
+  # ──────────────────────────────────────────────────────────────
+  - id: fetch
+    action: web_fetch
+    params:
+      urls:
+        - https://anthropic.com/news
+        - https://anthropic.com/research
+        - https://openai.com/news
+        - https://openai.com/research
+      extractMode: markdown
+    output: raw_news
+    timeout: 120
+
+  # ──────────────────────────────────────────────────────────────
+  # Step 2: Alex writes the daily digest
+  # ──────────────────────────────────────────────────────────────
+  - id: write
+    agent: alex
+    task: |
+      Write the AI News Digest for {{ inputs.date }}.
+      
+      ## Source Material
+      {{ steps.fetch.output }}
+      
+      ## Requirements
+      - Focus on official announcements only (no media reports)
+      - Include your analysis naturally in the text
+      - Format as Markdown with clear sections
+      - Identify articles that should be fully translated
+      
+      Output format:
+      1. The digest in Markdown
+      2. A list of article URLs to translate (if any)
+    output: draft
+    retry: 2
+
+  # ──────────────────────────────────────────────────────────────
+  # Step 3: Bob reviews the draft
+  # ──────────────────────────────────────────────────────────────
+  - id: review
+    agent: bob
+    task: |
+      Review the following news digest as Editorial Director.
+      
+      ## Draft
+      {{ steps.write.output.digest }}
+      
+      ## Evaluation Criteria
+      - News value (30 pts): Coverage of important events
+      - Accuracy (25 pts): Facts and data correctness
+      - Analysis depth (25 pts): Quality of insights
+      - Readability (20 pts): Writing quality
+      
+      ## Decision
+      - APPROVE: Score >= 85 and no factual errors
+      - REVISE: Score 70-84 or minor issues (provide feedback)
+      - REJECT: Score < 70 or major problems
+      
+      Output your decision as the first word, followed by detailed feedback.
+    output: review_result
+    decisions:
+      - match: "APPROVE"
+        action: continue
+      - match: "REVISE"
+        action: goto
+        target: write
+      - match: "REJECT"
+        action: abort
+        message: "Editorial rejection - digest quality below threshold"
+
+  # ──────────────────────────────────────────────────────────────
+  # Step 4: Alice translates articles (parallel)
+  # ──────────────────────────────────────────────────────────────
+  - id: translate
+    agent: alice
+    foreach: ${{ steps.write.output.articles_to_translate }}
+    parallel: true
+    task: |
+      Translate the following article to Chinese.
+      
+      ## Rules
+      - Keep names in original English (e.g., Miles McCain, not 迈尔斯·麦凯恩)
+      - Keep technical terms in English (API, LLM, pretraining)
+      - Translate completely - no omissions allowed
+      - Follow 信达雅 principles
+      
+      ## Article
+      {{ item.content }}
+    output: translations
+    timeout: 300
+
+  # ──────────────────────────────────────────────────────────────
+  # Step 5: Colly QAs translations
+  # ──────────────────────────────────────────────────────────────
+  - id: qa
+    agent: colly
+    foreach: ${{ steps.translate.output }}
+    task: |
+      Review this translation for quality.
+      
+      ## Original
+      {{ item.original }}
+      
+      ## Translation
+      {{ item.translation }}
+      
+      ## Checklist
+      1. Completeness: All sections translated? (VETO if incomplete)
+      2. Names/terms: Kept in English?
+      3. Accuracy (40 pts)
+      4. Fluency (30 pts)
+      5. Style (20 pts)
+      6. Format (10 pts)
+      
+      ## Decision
+      - PASS: Complete + Score >= 90
+      - REVISE: Score 80-89 (provide specific fixes)
+      - FAIL: Score < 80 or incomplete
+      
+      Output decision as first word, then detailed JSON report.
+    output: qa_results
+    decisions:
+      - match: "PASS"
+        action: continue
+      - match: "REVISE"
+        action: retry
+        max: 3
+      - match: "FAIL"
+        action: skip_item
+    
+  # ──────────────────────────────────────────────────────────────
+  # Step 6: Save and publish
+  # ──────────────────────────────────────────────────────────────
+  - id: save
+    action: write
+    params:
+      files:
+        - path: ${{ inputs.output_dir }}/zh/{{ inputs.date }}.md
+          content: ${{ steps.write.output.digest }}
+        - path: ${{ inputs.output_dir }}/translations/{{ inputs.date }}/
+          content: ${{ steps.qa.passed }}
+    condition: ${{ steps.qa.passed_count > 0 || steps.review.decision == 'APPROVE' }}
+
+  - id: publish
+    action: exec
+    params:
+      command: |
+        cd {{ inputs.output_dir }}
+        git add .
+        git commit -m "AI News Digest {{ inputs.date }} - {{ steps.qa.passed_count }} translations"
+        git push
+    condition: ${{ steps.save.success }}
+
+notifications:
+  on_complete:
+    announce: |
+      ✅ AI News Digest {{ inputs.date }} published!
+      - Articles: {{ steps.write.output.article_count }}
+      - Translations: {{ steps.qa.passed_count }}/{{ steps.translate.count }}
+      
+  on_fail:
+    announce: |
+      ❌ AI News Digest failed at step {{ failed_step }}
+      Error: {{ error.message }}
